@@ -1,0 +1,15 @@
+*.iml
+.gradle/
+.idea/
+local.properties
+build/
+app/build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.jks
+*.keystore
+*.env
+.env
+queue-screen.png
+*.apk
