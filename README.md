@@ -184,7 +184,6 @@ Veja também:
 - [Compatibilidade e testes em TVs reais](docs/COMPATIBILIDADE.md)
 - [Roteiro de testes](docs/TESTES.md)
 - [Decisões de interface](docs/DESIGN_UX.md)
-- [Especificação técnica original](TV_Remote_Android_Especificacao_Tecnica.md)
 
 ## Contribuindo
 
