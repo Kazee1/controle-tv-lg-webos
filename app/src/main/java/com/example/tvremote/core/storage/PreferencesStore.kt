@@ -36,6 +36,7 @@ class PreferencesStore(private val context: Context) {
         val name = stringPreferencesKey("tv_name")
         val model = stringPreferencesKey("tv_model")
         val location = stringPreferencesKey("tv_location")
+        val deviceId = stringPreferencesKey("tv_device_id")
         val mac = stringPreferencesKey("tv_mac")
         val secure = booleanPreferencesKey("secure_transport")
         val haptics = booleanPreferencesKey("haptics")
@@ -57,6 +58,7 @@ class PreferencesStore(private val context: Context) {
                     host = host,
                     model = p[Keys.model],
                     location = p[Keys.location],
+                    deviceId = p[Keys.deviceId],
                 )
             },
             mac = p[Keys.mac],
@@ -75,11 +77,12 @@ class PreferencesStore(private val context: Context) {
         p[Keys.name] = tv.name
         tv.model?.let { p[Keys.model] = it } ?: p.remove(Keys.model)
         tv.location?.let { p[Keys.location] = it } ?: p.remove(Keys.location)
+        tv.deviceId?.let { p[Keys.deviceId] = it } ?: p.remove(Keys.deviceId)
         p[Keys.secure] = secureTransport
     }
 
     suspend fun clearTv() = context.dataStore.edit { p ->
-        listOf(Keys.host, Keys.name, Keys.model, Keys.location, Keys.mac).forEach(p::remove)
+        listOf(Keys.host, Keys.name, Keys.model, Keys.location, Keys.deviceId, Keys.mac).forEach(p::remove)
     }
 
     suspend fun saveMac(mac: String?) = context.dataStore.edit { p ->

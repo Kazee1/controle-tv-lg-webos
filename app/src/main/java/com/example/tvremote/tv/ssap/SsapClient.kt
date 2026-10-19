@@ -2,7 +2,7 @@ package com.example.tvremote.tv.ssap
 
 import android.util.Log
 import com.example.tvremote.core.network.TvTls
-import com.example.tvremote.core.storage.SecurePairingStore
+import com.example.tvremote.core.storage.PairingStore
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withTimeout
@@ -15,10 +15,15 @@ import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import java.io.IOException
 
 class SsapException(message: String) : Exception(message)
+class SsapConnectionException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
-class SsapClient(private val secureStore: SecurePairingStore) {
+class SsapClient(
+    private val secureStore: PairingStore,
+    private val socketFactory: ((Request, WebSocketListener) -> WebSocket)? = null,
+) {
     private val counter = AtomicLong()
     private val generation = AtomicLong()
     private val pending = ConcurrentHashMap<String, CompletableDeferred<JSONObject>>()
@@ -28,31 +33,45 @@ class SsapClient(private val secureStore: SecurePairingStore) {
     private var activeHost: String? = null
     private var activeClient: OkHttpClient? = null
     @Volatile private var pairingPrompted = false
+    @Volatile var isConnected = false
+        private set
+    val connectedHost: String? get() = activeHost?.takeIf { isConnected }
 
     var onPairingPrompt: (() -> Unit)? = null
     var onDisconnected: ((Throwable?) -> Unit)? = null
 
     suspend fun connect(host: String, secure: Boolean = true): String {
-        close()
-        activeHost = host
-        val client = if (secure) TvTls.client(host, secureStore) else OkHttpClient.Builder().build()
-        activeClient = client
         val result = CompletableDeferred<String>()
-        registration = result
-        pairingPrompted = false
-        val url = if (secure) "wss://$host:3001" else "ws://$host:3000"
-        val session = generation.incrementAndGet()
-        socket = client.newWebSocket(Request.Builder().url(url).build(), listener(host, session))
-        return try {
-            withTimeout(12_000) { result.await() }
-        } catch (timeout: TimeoutCancellationException) {
-            if (!pairingPrompted) throw SsapException("A TV não respondeu ao handshake")
-            withTimeout(60_000) { result.await() }
+        synchronized(this) {
+            close()
+            activeHost = host
+            val client = (if (secure) TvTls.client(host, secureStore).newBuilder() else OkHttpClient.Builder())
+                .connectTimeout(4, TimeUnit.SECONDS).pingInterval(10, TimeUnit.SECONDS).build()
+            activeClient = client
+            registration = result
+            pairingPrompted = false
+            val url = if (secure) "wss://$host:3001" else "ws://$host:3000"
+            val session = generation.incrementAndGet()
+            val request = Request.Builder().url(url).build()
+            val listener = listener(host, session)
+            socket = socketFactory?.invoke(request, listener) ?: client.newWebSocket(request, listener)
+        }
+        try {
+            return try {
+                withTimeout(8_000) { result.await() }
+            } catch (timeout: TimeoutCancellationException) {
+                if (!pairingPrompted) throw SsapConnectionException("A TV não respondeu à conexão", timeout)
+                withTimeout(60_000) { result.await() }
+            }
+        } catch (error: Throwable) {
+            close()
+            throw error
         }
     }
 
     suspend fun request(uri: String, payload: JSONObject? = null, timeoutMs: Long = 8_000): JSONObject {
-        val ws = socket ?: throw SsapException("TV desconectada")
+        val session = generation.get()
+        val ws = socket?.takeIf { isConnected } ?: throw SsapConnectionException("TV desconectada")
         val id = "tv-${counter.incrementAndGet()}"
         val response = CompletableDeferred<JSONObject>()
         pending[id] = response
@@ -61,17 +80,23 @@ class SsapClient(private val secureStore: SecurePairingStore) {
         Log.d(LOG_TAG, "request id=$id uri=$uri")
         if (!ws.send(message.toString())) {
             pending.remove(id)
-            throw SsapException("Não foi possível enviar o comando")
+            val error = SsapConnectionException("A conexão com a TV foi interrompida")
+            failAll(error, session)
+            throw error
         }
         return try {
             withTimeout(timeoutMs) { response.await() }
+        } catch (timeout: TimeoutCancellationException) {
+            val error = SsapConnectionException("A TV parou de responder", timeout)
+            failAll(error, session)
+            throw error
         } finally {
             pending.remove(id)
         }
     }
 
     fun subscribe(uri: String, payload: JSONObject? = null, onValue: (JSONObject) -> Unit): String {
-        val ws = socket ?: throw SsapException("TV desconectada")
+        val ws = socket?.takeIf { isConnected } ?: throw SsapConnectionException("TV desconectada")
         val id = "sub-${counter.incrementAndGet()}"
         subscriptions[id] = onValue
         val message = JSONObject().put("id", id).put("type", "subscribe").put("uri", uri)
@@ -88,13 +113,14 @@ class SsapClient(private val secureStore: SecurePairingStore) {
         socket?.send(JSONObject().put("id", id).put("type", "unsubscribe").toString())
     }
 
-    fun close() {
+    @Synchronized fun close() {
         generation.incrementAndGet()
+        isConnected = false
         socket?.close(1000, "App em pausa")
         socket = null
         activeClient?.dispatcher?.executorService?.shutdown()
         activeClient = null
-        val error = SsapException("Conexão encerrada")
+        val error = SsapConnectionException("Conexão encerrada")
         pending.values.forEach { it.completeExceptionally(error) }
         pending.clear()
         subscriptions.clear()
@@ -119,7 +145,9 @@ class SsapClient(private val secureStore: SecurePairingStore) {
             val type = frame.optString("type")
             val payload = frame.optJSONObject("payload") ?: JSONObject()
             if (id != REGISTER_ID) {
-                Log.d(LOG_TAG, "response id=$id type=$type ok=${payload.opt("returnValue")} error=${errorText(frame)}")
+                val error = if (type == "error" || payload.opt("returnValue") == false) errorText(frame) else "none"
+                Log.d(LOG_TAG, "response id=$id type=$type ok=${payload.opt("returnValue")} error=$error")
+                if (payload.has("state")) Log.d(LOG_TAG, "power state=${payload.optString("state")} processing=${payload.optString("processing")}")
                 payload.optJSONObject("currentWidget")?.let { widget ->
                     Log.d(LOG_TAG, "keyboard focus=${widget.optBoolean("focus", false)} length=${widget.optInt("surroundingTextLength", -1)}")
                 }
@@ -135,6 +163,7 @@ class SsapClient(private val secureStore: SecurePairingStore) {
                         if (key.isBlank()) registration?.completeExceptionally(SsapException("A TV não forneceu a chave de pareamento"))
                         else {
                             secureStore.saveClientKey(host, key)
+                            isConnected = true
                             registration?.complete(key)
                         }
                     }
@@ -152,20 +181,30 @@ class SsapClient(private val secureStore: SecurePairingStore) {
                 return
             }
             pending.remove(id)?.complete(payload)
-            subscriptions[id]?.invoke(payload)
+            subscriptions[id]?.let { callback ->
+                runCatching { callback(payload) }.onFailure { Log.w(LOG_TAG, "Subscription callback failed", it) }
+            }
         }
 
-        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { if (session == generation.get()) failAll(t) }
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { if (session == generation.get()) failAll(null) }
+        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { failAll(t, session) }
+        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { failAll(null, session) }
+        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { failAll(null, session) }
     }
 
-    private fun failAll(error: Throwable?) {
-        val failure = error ?: SsapException("A TV encerrou a conexão")
+    @Synchronized private fun failAll(error: Throwable?, session: Long) {
+        if (!generation.compareAndSet(session, session + 1)) return
+        isConnected = false
+        val failedSocket = socket
+        socket = null
+        failedSocket?.cancel()
+        activeClient?.dispatcher?.executorService?.shutdown()
+        activeClient = null
+        val failure = SsapConnectionException("A conexão com a TV foi interrompida", error)
         registration?.takeUnless { it.isCompleted }?.completeExceptionally(failure)
         pending.values.forEach { it.completeExceptionally(failure) }
         pending.clear()
         subscriptions.clear()
-        onDisconnected?.invoke(error)
+        onDisconnected?.invoke(failure)
     }
 
     private fun errorText(frame: JSONObject): String {

@@ -10,14 +10,20 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-class SecurePairingStore(context: Context) {
+class SecurePairingStore(context: Context) : PairingStore {
     private val preferences = context.getSharedPreferences("secure_pairing", Context.MODE_PRIVATE)
     private val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
 
-    fun getClientKey(host: String): String? = decrypt(preferences.getString("client_${id(host)}", null))
-    fun saveClientKey(host: String, key: String) = save("client_${id(host)}", key)
-    fun getCertificatePin(host: String): String? = decrypt(preferences.getString("cert_${id(host)}", null))
-    fun saveCertificatePin(host: String, pin: String) = save("cert_${id(host)}", pin)
+    override fun getClientKey(host: String): String? = decrypt(preferences.getString("client_${id(host)}", null))
+    override fun saveClientKey(host: String, key: String) = save("client_${id(host)}", key)
+    override fun getCertificatePin(host: String): String? = decrypt(preferences.getString("cert_${id(host)}", null))
+    override fun saveCertificatePin(host: String, pin: String) = save("cert_${id(host)}", pin)
+
+    /** Called after certificate and stable identity (UDN or paired MAC) verification. */
+    fun copyVerifiedIdentity(oldHost: String, newHost: String) {
+        getCertificatePin(oldHost)?.let { saveCertificatePin(newHost, it) }
+        getClientKey(oldHost)?.let { saveClientKey(newHost, it) }
+    }
 
     fun forget(host: String) {
         preferences.edit().remove("client_${id(host)}").remove("cert_${id(host)}").apply()

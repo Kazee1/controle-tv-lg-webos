@@ -60,7 +60,8 @@ class TvDiscoveryService(context: Context) {
             val doc = factory.newDocumentBuilder().parse(stream)
             val name = doc.getElementsByTagName("friendlyName").item(0)?.textContent?.trim()
             val model = doc.getElementsByTagName("modelName").item(0)?.textContent?.trim()
-            tv.copy(name = name.orEmpty().ifBlank { tv.name }, model = model)
+            val udn = doc.getElementsByTagName("UDN").item(0)?.textContent?.trim()?.lowercase()
+            tv.copy(name = name.orEmpty().ifBlank { tv.name }, model = model, deviceId = udn ?: tv.deviceId)
         }
     }.getOrDefault(tv)
 

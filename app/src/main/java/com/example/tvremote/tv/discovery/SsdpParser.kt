@@ -14,6 +14,7 @@ object SsdpParser {
         if (headers.values.none { lgMarker.containsMatchIn(it) }) return null
         val location = headers["location"] ?: return null
         val host = runCatching { URI(location).host }.getOrNull() ?: return null
-        return TvDevice(name = headers["friendlyname"] ?: "LG webOS TV", host = host, location = location)
+        return TvDevice(name = headers["friendlyname"] ?: "LG webOS TV", host = host, location = location,
+            deviceId = headers["usn"]?.substringBefore("::")?.lowercase()?.takeIf { it.startsWith("uuid:") })
     }
 }

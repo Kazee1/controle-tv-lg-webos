@@ -163,9 +163,11 @@ private fun ConnectionBar(state: TvUiState, repository: TvControlRepository) {
         ) {
             Box(Modifier.size(9.dp).clip(CircleShape).background(if (state.phase == ConnectionPhase.CONNECTED) Color(0xFF58D68D) else MaterialTheme.colorScheme.error))
             Spacer(Modifier.width(9.dp))
-            Text(state.selectedTv?.name ?: "TV", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            Text(state.statusMessage, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (state.phase != ConnectionPhase.CONNECTED) IconButton(onClick = repository::reconnect) { Icon(Icons.Rounded.Refresh, "Reconectar") }
+            Column(Modifier.weight(1f)) {
+                Text(state.selectedTv?.name ?: "TV", fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(state.statusMessage, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (state.phase !in setOf(ConnectionPhase.CONNECTED, ConnectionPhase.CONNECTING, ConnectionPhase.WAITING_FOR_TV)) IconButton(onClick = repository::reconnect) { Icon(Icons.Rounded.Refresh, "Reconectar") }
         }
     }
 }
@@ -566,6 +568,24 @@ private fun TouchpadScreen(state: TvUiState, repository: TvControlRepository, mo
 @Composable
 private fun SettingsScreen(state: TvUiState, repository: TvControlRepository, modifier: Modifier, onBack: () -> Unit) {
     var confirmForget by remember { mutableStateOf(false) }
+    var chooseTv by remember { mutableStateOf(false) }
+    var manualHost by remember { mutableStateOf("") }
+    if (chooseTv) AlertDialog(
+        onDismissRequest = { chooseTv = false },
+        title = { Text("Encontrar a TV") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Selecione sua TV se o roteador mudou o endereço dela.")
+                state.discoveredTvs.forEach { tv ->
+                    TextButton(onClick = { repository.selectTv(tv); chooseTv = false }) { Text("${tv.name} • ${tv.host}") }
+                }
+                OutlinedTextField(manualHost, { manualHost = it }, label = { Text("IP da TV") }, singleLine = true)
+                TextButton(onClick = repository::discover) { Text("Procurar novamente") }
+            }
+        },
+        confirmButton = { TextButton(onClick = { repository.connectManual(manualHost); chooseTv = false }, enabled = manualHost.isNotBlank()) { Text("Conectar pelo IP") } },
+        dismissButton = { TextButton(onClick = { chooseTv = false }) { Text("Voltar") } },
+    )
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item {
             TextButton(onClick = onBack) {
@@ -580,8 +600,9 @@ private fun SettingsScreen(state: TvUiState, repository: TvControlRepository, mo
                 Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = repository::reconnect) { Text("Reconectar") }
+                    TextButton(onClick = { chooseTv = true; repository.discover() }) { Text("Procurar TVs / IP") }
                 }
-                Text("O botão power do Controle liga pela rede quando a TV está desligada.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Sem conexão não significa necessariamente desligada. O botão power envia o sinal de ligar pela rede quando não há controle ativo.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
         item {

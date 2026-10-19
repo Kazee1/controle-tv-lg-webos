@@ -6,12 +6,14 @@ enum class ConnectionPhase {
 }
 
 enum class CapabilityState { UNKNOWN, SUPPORTED, UNSUPPORTED, DENIED }
+enum class TvPowerState { UNKNOWN, ON, STANDBY }
 
 data class TvDevice(
     val name: String,
     val host: String,
     val model: String? = null,
     val location: String? = null,
+    val deviceId: String? = null,
 )
 
 data class TvApp(
@@ -103,4 +105,5 @@ data class TvUiState(
     val youtubeQueue: List<YouTubeQueueItem> = emptyList(),
     val resolvingYouTubeQueueItemId: String? = null,
     val commandInFlight: Boolean = false,
+    val powerState: TvPowerState = TvPowerState.UNKNOWN,
 )

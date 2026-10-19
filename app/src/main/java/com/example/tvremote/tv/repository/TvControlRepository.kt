@@ -8,6 +8,7 @@ import com.example.tvremote.core.model.TvCapabilities
 import com.example.tvremote.core.model.TvDevice
 import com.example.tvremote.core.model.TvInput
 import com.example.tvremote.core.model.TvUiState
+import com.example.tvremote.core.model.TvPowerState
 import com.example.tvremote.core.model.UsageSummary
 import com.example.tvremote.core.model.YouTubePlaybackEstimate
 import com.example.tvremote.core.model.YouTubeQueueItem
@@ -15,14 +16,17 @@ import com.example.tvremote.core.network.TvTls
 import com.example.tvremote.core.network.WakeOnLan
 import com.example.tvremote.core.storage.PreferencesStore
 import com.example.tvremote.core.storage.SecurePairingStore
+import com.example.tvremote.core.storage.PairingStore
 import com.example.tvremote.tv.discovery.TvDiscoveryService
 import com.example.tvremote.tv.pointer.PointerClient
 import com.example.tvremote.tv.ssap.SsapClient
 import com.example.tvremote.tv.ssap.SsapException
+import com.example.tvremote.tv.ssap.SsapConnectionException
 import com.example.tvremote.youtube.YouTubeResolver
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,6 +35,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
@@ -41,6 +47,9 @@ import java.time.ZoneId
 import java.time.temporal.TemporalAdjusters
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.UUID
+import java.net.InetSocketAddress
+import java.net.Socket
+import javax.net.ssl.SSLException
 
 class TvControlRepository(
     private val preferences: PreferencesStore,
@@ -52,12 +61,16 @@ class TvControlRepository(
     private val pointer = PointerClient(secureStore)
     private val youtubeResolver = YouTubeResolver()
     private val connecting = AtomicBoolean(false)
+    private val connectionMutex = Mutex()
+    private val pointerMutex = Mutex()
     private var reconnectJob: Job? = null
+    private var heartbeatJob: Job? = null
+    private var refreshJob: Job? = null
     private var backgroundCloseJob: Job? = null
     private var youtubeQueueJob: Job? = null
     private var youtubeQueueAppId: String? = null
-    private var appActive = false
-    private var deliberateDisconnect = false
+    @Volatile private var appActive = false
+    @Volatile private var deliberateDisconnect = false
 
     private val _state = MutableStateFlow(TvUiState())
     val state: StateFlow<TvUiState> = _state.asStateFlow()
@@ -67,17 +80,7 @@ class TvControlRepository(
             _state.update { it.copy(phase = ConnectionPhase.WAITING_FOR_TV, statusMessage = "Confirme o pareamento na tela da TV") }
         }
         ssap.onDisconnected = {
-            pointer.close()
-            scope.launch { preferences.closeUsage(); refreshUsage() }
-            if (!deliberateDisconnect) {
-                _state.update { current ->
-                    current.copy(
-                        phase = if (current.phase == ConnectionPhase.CONNECTED) ConnectionPhase.DISCONNECTED else current.phase,
-                        statusMessage = if (current.phase == ConnectionPhase.CONNECTED) "TV desconectada" else current.statusMessage,
-                    )
-                }
-                scheduleReconnect()
-            }
+            if (!deliberateDisconnect && !connecting.get()) connectionLost()
         }
         scope.launch {
             val saved = preferences.preferences.first()
@@ -103,7 +106,8 @@ class TvControlRepository(
         if (active) {
             backgroundCloseJob?.cancel()
             val tv = _state.value.selectedTv
-            if (tv != null && _state.value.phase != ConnectionPhase.CONNECTED) connect(tv)
+            if (tv != null && !ssap.isConnected) connect(tv)
+            else if (ssap.isConnected) monitorSession()
         } else {
             reconnectJob?.cancel()
             scope.launch { preferences.closeUsage(); refreshUsage() }
@@ -114,8 +118,10 @@ class TvControlRepository(
                     deliberateDisconnect = true
                     ssap.close()
                     pointer.close()
+                    heartbeatJob?.cancel()
+                    refreshJob?.cancel()
                     deliberateDisconnect = false
-                    _state.update { current -> current.copy(phase = ConnectionPhase.DISCONNECTED, statusMessage = "Conexão pausada") }
+                    _state.update { current -> current.copy(phase = ConnectionPhase.DISCONNECTED, powerState = TvPowerState.UNKNOWN, keyboardFocused = false, statusMessage = "Conexão pausada") }
                 }
             }
         }
@@ -123,14 +129,15 @@ class TvControlRepository(
 
     fun discover() {
         scope.launch {
-            _state.update { it.copy(phase = ConnectionPhase.DISCOVERING, statusMessage = "Procurando TVs na rede…", errorMessage = null) }
+            val previous = _state.value.phase
+            _state.update { it.copy(phase = if (ssap.isConnected) it.phase else ConnectionPhase.DISCOVERING, errorMessage = null) }
             runCatching { discovery.discover() }
                 .onSuccess { devices ->
                     _state.update {
                         it.copy(
-                            phase = if (it.selectedTv == null) ConnectionPhase.NOT_CONFIGURED else ConnectionPhase.SELECTED,
+                            phase = if (ssap.isConnected) it.phase else if (it.selectedTv == null) ConnectionPhase.NOT_CONFIGURED else previous,
                             discoveredTvs = devices,
-                            statusMessage = if (devices.isEmpty()) "Nenhuma TV encontrada. Use o IP manual." else "${devices.size} TV(s) encontrada(s)",
+                            statusMessage = if (ssap.isConnected) it.statusMessage else if (devices.isEmpty()) "Nenhuma TV encontrada. Use o IP manual." else "${devices.size} TV(s) encontrada(s)",
                         )
                     }
                 }
@@ -148,9 +155,12 @@ class TvControlRepository(
     }
 
     fun selectTv(tv: TvDevice) {
+        reconnectJob?.cancel()
         scope.launch {
-            preferences.saveTv(tv)
-            _state.update { it.copy(selectedTv = tv, phase = ConnectionPhase.SELECTED, errorMessage = null) }
+            connectionMutex.withLock {
+                preferences.saveTv(tv)
+                _state.update { it.copy(selectedTv = tv, phase = ConnectionPhase.SELECTED, errorMessage = null) }
+            }
             if (!connectNow(tv)) scheduleReconnect()
         }
     }
@@ -158,20 +168,29 @@ class TvControlRepository(
     fun reconnect() = _state.value.selectedTv?.let(::connect)
 
     fun forgetTv() {
+        reconnectJob?.cancel()
+        heartbeatJob?.cancel()
+        refreshJob?.cancel()
         scope.launch {
-            deliberateDisconnect = true
-            val host = _state.value.selectedTv?.host
-            ssap.close()
-            pointer.close()
-            host?.let(secureStore::forget)
-            preferences.clearTv()
-            deliberateDisconnect = false
-            _state.value = TvUiState(statusMessage = "Encontre sua TV para começar")
+            connectionMutex.withLock {
+                deliberateDisconnect = true
+                val host = _state.value.selectedTv?.host
+                ssap.close()
+                pointer.close()
+                host?.let(secureStore::forget)
+                preferences.clearTv()
+                deliberateDisconnect = false
+                _state.value = TvUiState(statusMessage = "Encontre sua TV para começar")
+            }
         }
     }
 
     fun sendButton(name: String) = command {
-        if (!pointer.button(name)) throw SsapException("Canal do controle indisponível")
+        ensurePointer()
+        if (!pointer.button(name)) {
+            ensurePointer()
+            if (!pointer.button(name)) throw SsapException("Canal do controle indisponível")
+        }
     }
 
     fun movePointer(dx: Float, dy: Float) {
@@ -179,7 +198,7 @@ class TvControlRepository(
         pointer.move((dx * gain).toInt(), (dy * gain).toInt())
     }
 
-    fun clickPointer() { if (!pointer.click()) showError("Touchpad indisponível") }
+    fun clickPointer() = command { ensurePointer(); if (!pointer.click()) throw SsapException("Touchpad indisponível") }
     fun scrollPointer(dy: Float) { pointer.scroll((dy * _state.value.pointerSensitivity).toInt().coerceIn(-30, 30)) }
 
     fun volumeUp() = command { ssap.request("ssap://audio/volumeUp") }
@@ -188,7 +207,7 @@ class TvControlRepository(
     fun toggleMute() = command { ssap.request("ssap://audio/setMute", JSONObject().put("mute", !_state.value.muted)) }
     fun turnOff() = command {
         ssap.request("ssap://system/turnOff")
-        _state.update { it.copy(phase = ConnectionPhase.STANDBY, statusMessage = "TV em standby") }
+        _state.update { it.copy(phase = ConnectionPhase.STANDBY, powerState = TvPowerState.STANDBY, keyboardFocused = false, statusMessage = "TV em standby") }
     }
 
     fun launchApp(id: String) = command { ssap.request("ssap://system.launcher/launch", JSONObject().put("id", id)) }
@@ -399,10 +418,11 @@ class TvControlRepository(
             showError("O MAC da interface ativa ainda não foi identificado")
             return
         }
+        reconnectJob?.cancel()
         scope.launch {
             runCatching { WakeOnLan.wake(mac, tv.host) }
                 .onSuccess {
-                    _state.update { it.copy(statusMessage = "Sinal de despertar enviado; aguardando a TV…", phase = ConnectionPhase.RECONNECTING) }
+                    _state.update { it.copy(statusMessage = "Sinal de despertar enviado; aguardando a TV…", powerState = TvPowerState.UNKNOWN, errorMessage = null, phase = ConnectionPhase.RECONNECTING) }
                     delay(3_000)
                     if (!connectNow(tv)) scheduleReconnect()
                 }
@@ -456,51 +476,184 @@ class TvControlRepository(
         }
     }
 
-    private fun connect(tv: TvDevice) = scope.launch { if (!connectNow(tv)) scheduleReconnect() }
+    private fun connect(tv: TvDevice) {
+        reconnectJob?.cancel()
+        scope.launch { if (!connectNow(tv)) scheduleReconnect() }
+    }
 
-    private suspend fun connectNow(tv: TvDevice): Boolean {
-        // Outra chamada já está estabelecendo a mesma sessão. Isso não é falha e não deve
-        // agendar uma reconexão concorrente, pois ela fecharia o socket recém-aberto.
-        if (!connecting.compareAndSet(false, true)) return true
+    private fun reachable(host: String): Boolean = listOf(3001, 3000).any { port ->
+        runCatching { Socket().use { it.connect(InetSocketAddress(host, port), 1_000) }; true }.getOrDefault(false)
+    }
+
+    private suspend fun resolveEndpoint(saved: TvDevice): TvDevice? {
+        val pin = secureStore.getCertificatePin(saved.host)
+        if (reachable(saved.host) && (pin == null || TvTls.matchesSavedIdentity(saved.host, pin))) return saved
+        val devices = try { discovery.discover(2_500) } catch (cancel: CancellationException) {
+            throw cancel
+        } catch (_: Exception) { emptyList() }
+        _state.update { it.copy(discoveredTvs = devices) }
+        // LG can share certificates across TVs. A matching certificate alone is NOT
+        // unique identity: also require UDN or a MAC read through the existing pairing.
+        val expectedMac = _state.value.macAddress
+        val oldKey = secureStore.getClientKey(saved.host)
+        val candidate = devices.firstOrNull { device ->
+            if (device.host == saved.host || pin == null || !TvTls.matchesSavedIdentity(device.host, pin)) return@firstOrNull false
+            if (saved.deviceId != null && !ConnectionPolicy.sameDevice(saved, device)) return@firstOrNull false
+            if (expectedMac == null) return@firstOrNull ConnectionPolicy.sameDevice(saved, device)
+            if (oldKey == null) return@firstOrNull false
+            val temporaryStore = object : PairingStore {
+                override fun getClientKey(host: String) = oldKey
+                override fun saveClientKey(host: String, key: String) = Unit
+                override fun getCertificatePin(host: String) = pin
+                override fun saveCertificatePin(host: String, pin: String) = Unit
+            }
+            val probe = SsapClient(temporaryStore)
+            probe.onPairingPrompt = { probe.close() } // Never silently pair a different TV.
+            try {
+                probe.connect(device.host)
+                val info = probe.request("ssap://com.webos.service.connectionmanager/getinfo", timeoutMs = 3_000)
+                listOf("wifiInfo", "wiredInfo").any { kind ->
+                    info.optJSONObject(kind)?.optString("macAddress")?.replace("-", ":")?.equals(expectedMac.replace("-", ":"), true) == true
+                }
+            } catch (cancel: CancellationException) { throw cancel
+            } catch (_: Exception) { false
+            } finally { probe.close() }
+        } ?: return null
+        secureStore.copyVerifiedIdentity(saved.host, candidate.host)
+        preferences.saveTv(candidate)
+        _state.update { it.copy(selectedTv = candidate, appIcons = emptyMap(), statusMessage = "Endereço da TV atualizado para ${candidate.host}") }
+        return candidate
+    }
+
+    private suspend fun connectNow(requested: TvDevice, quiet: Boolean = false): Boolean = connectionMutex.withLock {
+        if (_state.value.selectedTv?.host != requested.host) return@withLock false
+        if (ssap.connectedHost == requested.host) return@withLock true
+        connecting.set(true)
         deliberateDisconnect = true
+        heartbeatJob?.cancel()
+        refreshJob?.cancel()
+        ssap.close()
+        pointer.close()
         try {
-            _state.update { it.copy(phase = ConnectionPhase.CONNECTING, statusMessage = "Conectando a ${tv.name}…", errorMessage = null) }
+            if (!quiet) _state.update { it.copy(phase = ConnectionPhase.CONNECTING, statusMessage = "Verificando a TV na rede…", errorMessage = null) }
+            val tv = resolveEndpoint(requested)
+                ?: throw SsapConnectionException("TV não encontrada no endereço salvo; use Procurar TVs se o endereço mudou")
+            _state.update { it.copy(phase = ConnectionPhase.CONNECTING, statusMessage = "Conectando a ${tv.host}…", errorMessage = null) }
             val secureTransport = preferences.preferences.first().secureTransport
             if (secureTransport) {
                 try {
                     ssap.connect(tv.host, secure = true)
+                } catch (cancel: CancellationException) {
+                    throw cancel
                 } catch (secureError: Throwable) {
+                    // Never bypass a certificate/pairing rejection using plaintext.
+                    if (generateSequence(secureError) { it.cause }.any { it is SSLException || it is SsapException }) throw secureError
                     ssap.connect(tv.host, secure = false)
                     preferences.saveTv(tv, secureTransport = false)
                 }
             } else {
                 try {
                     ssap.connect(tv.host, secure = false)
+                } catch (cancel: CancellationException) {
+                    throw cancel
                 } catch (plainError: Throwable) {
+                    if (plainError is SsapException) throw plainError
                     ssap.connect(tv.host, secure = true)
                     preferences.saveTv(tv, secureTransport = true)
                 }
             }
-            val pointerPath = ssap.request("ssap://com.webos.service.networkinput/getPointerInputSocket").optString("socketPath")
-            if (pointerPath.isNotBlank()) pointer.connect(tv.host, pointerPath)
             _state.update {
                 it.copy(
                     phase = ConnectionPhase.CONNECTED,
-                    statusMessage = "Conectada a ${tv.name}",
-                    capabilities = it.capabilities.copy(pointer = if (pointerPath.isBlank()) CapabilityState.UNSUPPORTED else CapabilityState.SUPPORTED),
+                    powerState = TvPowerState.UNKNOWN,
+                    statusMessage = "Conectada • ${tv.host}",
+                    errorMessage = null,
                 )
             }
             preferences.startUsage(null)
             installSubscriptions()
-            refreshAll()
-            return true
+            monitorSession()
+            refreshJob?.cancel()
+            refreshJob = scope.launch {
+                try {
+                    try { ensurePointer()
+                    } catch (cancel: CancellationException) { throw cancel
+                    } catch (error: SsapConnectionException) { throw error
+                    } catch (_: Exception) {
+                        _state.update { it.copy(capabilities = it.capabilities.copy(pointer = CapabilityState.UNKNOWN)) }
+                    }
+                    refreshAll()
+                } catch (cancel: CancellationException) { throw cancel
+                } catch (error: Exception) {
+                    if (error is SsapConnectionException) connectionLost()
+                }
+            }
+            return@withLock true
+        } catch (cancel: CancellationException) {
+            ssap.close()
+            throw cancel
         } catch (error: Throwable) {
-            _state.update { it.copy(phase = ConnectionPhase.DISCONNECTED, statusMessage = "TV indisponível", errorMessage = friendly(error)) }
-            return false
+            ssap.close()
+            pointer.close()
+            _state.update { it.copy(phase = if (it.powerState == TvPowerState.STANDBY) ConnectionPhase.STANDBY else ConnectionPhase.DISCONNECTED,
+                keyboardFocused = false, commandInFlight = false,
+                statusMessage = ConnectionPolicy.offlineMessage(it.powerState == TvPowerState.STANDBY),
+                errorMessage = if (quiet) it.errorMessage else friendly(error)) }
+            return@withLock false
         } finally {
             deliberateDisconnect = false
             connecting.set(false)
         }
+    }
+
+    private suspend fun ensurePointer() = pointerMutex.withLock {
+        if (pointer.isConnected) return@withLock
+        val tv = _state.value.selectedTv ?: throw SsapException("TV não configurada")
+        val path = ssap.request("ssap://com.webos.service.networkinput/getPointerInputSocket").optString("socketPath")
+        if (path.isBlank()) throw SsapException("Canal do controle indisponível")
+        pointer.connect(tv.host, path)
+        _state.update { it.copy(capabilities = it.capabilities.copy(pointer = CapabilityState.SUPPORTED)) }
+    }
+
+    private fun applyPower(payload: JSONObject) {
+        val power = ConnectionPolicy.powerState(payload.optString("state"), payload.optString("processing"))
+        if (power == TvPowerState.UNKNOWN) return
+        _state.update { current ->
+            current.copy(powerState = power,
+                phase = if (power == TvPowerState.ON) ConnectionPhase.CONNECTED else ConnectionPhase.STANDBY,
+                statusMessage = if (power == TvPowerState.ON) "TV ligada • ${current.selectedTv?.host}" else "TV em standby",
+                errorMessage = null)
+        }
+    }
+
+    private fun monitorSession() {
+        heartbeatJob?.cancel()
+        heartbeatJob = scope.launch {
+            while (ssap.isConnected) {
+                try {
+                    // Request/response confirms a live session, unlike a cached socket.
+                    ssap.request("ssap://com.webos.applicationManager/getForegroundAppInfo", timeoutMs = 4_000)
+                    try { applyPower(ssap.request("ssap://com.webos.service.tvpower/power/getPowerState", timeoutMs = 4_000))
+                    } catch (_: SsapException) { /* unsupported power API: keep power unknown */ }
+                } catch (cancel: CancellationException) { throw cancel
+                } catch (error: SsapConnectionException) { connectionLost(); return@launch
+                } catch (_: SsapException) { /* API denial is not a transport failure */ }
+                delay(10_000)
+            }
+        }
+    }
+
+    private fun connectionLost() {
+        pointer.close()
+        refreshJob?.cancel()
+        _state.update { current -> current.copy(
+            phase = if (current.powerState == TvPowerState.STANDBY) ConnectionPhase.STANDBY else ConnectionPhase.DISCONNECTED,
+            powerState = if (current.powerState == TvPowerState.STANDBY) TvPowerState.STANDBY else TvPowerState.UNKNOWN,
+            keyboardFocused = false, commandInFlight = false,
+            statusMessage = ConnectionPolicy.offlineMessage(current.powerState == TvPowerState.STANDBY), errorMessage = null,
+        ) }
+        scope.launch { preferences.closeUsage(); refreshUsage() }
+        scheduleReconnect()
     }
 
     private fun installSubscriptions() {
@@ -526,18 +679,22 @@ class TvControlRepository(
         }.onFailure { _state.update { s -> s.copy(capabilities = s.capabilities.copy(keyboard = CapabilityState.UNSUPPORTED)) } }
         runCatching {
             ssap.subscribe("ssap://com.webos.service.tvpower/power/getPowerState") { payload ->
-                // Alguns firmwares emitem "Suspend" transitoriamente mesmo mantendo o socket e
-                // aceitando comandos. A conexão só muda de estado quando o socket realmente cai.
+                applyPower(payload)
             }
         }
     }
 
     private suspend fun refreshAll() {
-        runCatching { applyVolume(ssap.request("ssap://audio/getVolume")) }
-        runCatching { loadApps() }
-        runCatching { loadInputs() }
-        runCatching { loadPicture() }
-        runCatching { loadNetworkInfo() }
+        suspend fun optional(action: suspend () -> Unit) {
+            try { action() } catch (cancel: CancellationException) { throw cancel
+            } catch (error: SsapConnectionException) { throw error
+            } catch (_: Exception) { /* optional firmware capability */ }
+        }
+        optional { applyVolume(ssap.request("ssap://audio/getVolume")) }
+        optional { loadApps() }
+        optional { loadInputs() }
+        optional { loadNetworkInfo() }
+        optional { loadPicture() }
         refreshUsage()
     }
 
@@ -581,7 +738,7 @@ class TvControlRepository(
                 )
             }.onSuccess { payload ->
                 payload.optJSONObject("settings")?.takeIf { it.has(key) }?.let { settings.put(key, it.get(key)) }
-            }.onFailure { lastError = it }
+            }.onFailure { if (it is CancellationException || it is SsapConnectionException) throw it; lastError = it }
         }
         if (settings.length() == 0) throw lastError ?: SsapException("A TV não liberou ajustes de imagem")
         _state.update { current ->
@@ -654,10 +811,10 @@ class TvControlRepository(
             else -> null
         }?.takeIf(WakeOnLan::isValidMac)
         val wolEnabled = if (wifiActive) status.optJSONObject("wifi")?.optBoolean("isWakeOnWifiEnabled") else wiredActive
-        preferences.saveMac(mac)
+        if (mac != null) preferences.saveMac(mac)
         _state.update {
             it.copy(
-                macAddress = mac,
+                macAddress = mac ?: it.macAddress,
                 wakeOnWifiEnabled = wolEnabled,
                 capabilities = it.capabilities.copy(wakeOnLan = when {
                     mac == null -> CapabilityState.UNKNOWN
@@ -735,7 +892,14 @@ class TvControlRepository(
 
     private fun startYouTubeQueue() {
         if (youtubeQueueJob?.isActive == true) return
-        youtubeQueueJob = scope.launch { runYouTubeQueue() }
+        youtubeQueueJob = scope.launch {
+            try { runYouTubeQueue() }
+            catch (cancel: CancellationException) { throw cancel }
+            catch (error: Exception) {
+                _state.update { it.copy(resolvingYouTubeQueueItemId = null) }
+                showError("Fila pausada: ${friendly(error)}")
+            }
+        }
     }
 
     private suspend fun runYouTubeQueue() {
@@ -779,11 +943,18 @@ class TvControlRepository(
                 showError("YouTube não encontrado na TV")
                 return
             }
-            ssap.request(
-                "ssap://com.webos.applicationManager/launch",
-                JSONObject().put("id", appId)
-                    .put("params", JSONObject().put("contentTarget", "v=${video.id}")),
-            )
+            try {
+                ssap.request(
+                    "ssap://com.webos.applicationManager/launch",
+                    JSONObject().put("id", appId)
+                        .put("params", JSONObject().put("contentTarget", "v=${video.id}")),
+                )
+            } catch (cancel: CancellationException) { throw cancel
+            } catch (error: SsapConnectionException) {
+                _state.update { it.copy(resolvingYouTubeQueueItemId = null) }
+                connectionLost()
+                continue // Keep the item in the queue until the TV reconnects.
+            }
             val estimatedStart = System.currentTimeMillis() + _state.value.youtubeBufferSeconds * 1_000L
             val estimate = YouTubePlaybackEstimate(
                 videoId = video.id,
@@ -816,33 +987,41 @@ class TvControlRepository(
     }
 
     private fun command(action: suspend () -> Unit) {
-        if (_state.value.phase != ConnectionPhase.CONNECTED) {
-            showError("Conecte a TV antes de enviar comandos")
+        if (_state.value.phase != ConnectionPhase.CONNECTED || !ssap.isConnected) {
+            if (!ssap.isConnected && _state.value.selectedTv != null) scheduleReconnect()
+            showError(if (_state.value.powerState == TvPowerState.STANDBY) "Ligue a TV antes de enviar comandos" else "Sem conexão com a TV; verificando a rede")
             return
         }
         scope.launch {
             _state.update { it.copy(commandInFlight = true, errorMessage = null) }
-            runCatching { action() }.onFailure { showError(friendly(it)) }
-            _state.update { it.copy(commandInFlight = false) }
+            try { action() }
+            catch (cancel: CancellationException) { throw cancel }
+            catch (error: SsapConnectionException) { connectionLost() }
+            catch (error: Exception) { showError(friendly(error)) }
+            finally { _state.update { it.copy(commandInFlight = false) } }
         }
     }
 
     private fun scheduleReconnect() {
-        if (!appActive || deliberateDisconnect || _state.value.selectedTv == null) return
-        reconnectJob?.cancel()
+        if ((!appActive && youtubeQueueJob?.isActive != true) || deliberateDisconnect || _state.value.selectedTv == null) return
+        if (reconnectJob?.isActive == true) return
         reconnectJob = scope.launch {
-            val tv = _state.value.selectedTv ?: return@launch
-            for (attempt in 1..3) {
-                _state.update { it.copy(phase = ConnectionPhase.RECONNECTING, statusMessage = "Reconectando ($attempt/3)…") }
-                delay((attempt * attempt * 1_000).toLong())
-                if (connectNow(tv)) return@launch
+            var attempt = 0
+            while (appActive || youtubeQueueJob?.isActive == true) {
+                delay(if (attempt < 3) (1_000L shl attempt) else 30_000L)
+                val tv = _state.value.selectedTv ?: return@launch
+                if (ssap.isConnected || connectNow(tv, quiet = true)) return@launch
+                attempt++
             }
-            _state.update { it.copy(phase = ConnectionPhase.DISCONNECTED, statusMessage = "TV fora da rede") }
         }
     }
 
     private fun showError(message: String) = _state.update { it.copy(errorMessage = message) }
-    private fun friendly(error: Throwable): String = error.message?.substringBefore("\n") ?: "Erro inesperado"
+    private fun friendly(error: Throwable): String = when (error) {
+        is SsapConnectionException, is java.net.ConnectException -> "TV não encontrada na rede. O endereço pode ter mudado; use Procurar TVs."
+        is java.net.SocketTimeoutException -> "A TV não respondeu. Verifique se ela e o celular estão na mesma rede."
+        else -> error.message?.substringBefore("\n") ?: "Erro inesperado"
+    }
     private fun isValidHost(value: String) = value.matches(Regex("^[a-zA-Z0-9.-]+$")) && value.length in 1..253
 }
 
